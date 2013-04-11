@@ -26,7 +26,7 @@ along with CSRNG.  If not, see <http://www.gnu.org/licenses/>.
 #include <errno.h>
 #include <unistd.h>
 #include <ctype.h>
-#include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
 #include <assert.h>
 
@@ -90,7 +90,24 @@ void usage (void) {
       "-m Mode for the AES encryption\n"
       "-k Key for the AES encryption of length 16, 24 or 32 bytes\n"
       "-e Key for the final encryption (Encrypt-last-block)\n"
-      "FILE File for which CBC_EMAC will be computed - if not specified, STDIN will be used\n");
+      "FILE File for which CBC_EMAC will be computed - if not specified, STDIN will be used\n"
+      "Example:\n"
+      "aes_cbc_elb -m 128 -k 859d1c778cdfe4ef7c2fecae2f69e04e -e d2a60282e82d69c21d7e882d5a9b56d8 /dev/null\n"
+      "head -c 64 /dev/zero | aes_cbc_elb -m 128 -k 859d1c778cdfe4ef7c2fecae2f69e04e -e d2a60282e82d69c21d7e882d5a9b56d8\n"
+      "pv --wait </dev/zero | aes_cbc_elb -m 128 -k 859d1c778cdfe4ef7c2fecae2f69e04e -e d2a60282e82d69c21d7e882d5a9b56d8\n"
+      );
+}
+
+void print_hex(FILE *stream, const char *name, UCHAR *buf, size_t len) {
+  size_t i;
+
+  for ( i=0; i<len; i++ ) {
+    if ( (i % 16) == 0 ) fprintf(stream, "%s", name);
+    fprintf(stream, "%02x", buf[i]);
+    if ( (i % 4) == 3 ) fprintf(stream, " ");
+    if ( (i % 16) == 15 ) fprintf(stream, "\n");
+  }
+  if ( (i % 16) != 0 ) fprintf(stream, "\n");
 }
 
 int  main(int argc, char **argv) {
@@ -109,6 +126,7 @@ int  main(int argc, char **argv) {
   FILE* fd;
   const unsigned int aes_block_size = 16;                    //Size of the data blocks - 16 Bytes
   const unsigned int step_size = 1024;                       //How much aes_blocks do we process at once
+  uint64_t total_bytes = 0;
 
 
   opterr = 0;
@@ -160,11 +178,15 @@ int  main(int argc, char **argv) {
     fd = stdin;
   } else if ( argc == optind + 1 ) {
     fd = fopen ( argv[optind], "r" );
-    if ( fd == NULL ) fprintf(stderr, "ERROR: Cannot open file '%s' for reading. Reported error: %s\n", argv[optind], strerror(errno));
+    if ( fd == NULL ) { 
+      fprintf(stderr, "ERROR: Cannot open file '%s' for reading. Reported error: %s\n", argv[optind], strerror(errno));
+      return 1;
+    }
   } else {
       fprintf(stderr, "Unexpected arguments\n");
       optind++;
       while (optind < argc) printf("'%s'\n", argv[optind++]);
+      usage();
       return 1;
   }
     
@@ -175,17 +197,20 @@ int  main(int argc, char **argv) {
       || (endptr == mode)
       || (*endptr !=0) ) {
     fprintf(stderr, "Error when parsing -m value \'%s\'\n", mode);
+    usage();
     return 1;
   }
 
   if ( mode_val != 128 && mode_val != 192 && mode_val != 256 ) {
     fprintf (stderr, "Mode has to be one of 128, 192, 256. Got %ld.\n", mode_val);
+    usage();
     return 1;
   }
 
   for (i=0; i<2; ++i) {
     if ( strlen(key[i]) != (unsigned long) mode_val/4 ) {
       fprintf (stderr, "Key '%s': length has to be %ld Bytes but is %zu\n", key[i], mode_val/4, strlen(key[i]) );
+      usage();
       return 1;
     }
   }
@@ -202,6 +227,7 @@ int  main(int argc, char **argv) {
         parse_byte[j%2] = key[i][j];
       } else {
         fprintf (stderr, "Invalid char in key %s.\nExpecting 16-bit number, got `%c`\n", key[i], key[i][j] );
+        usage();
         return 1;
       }
       if ( j%2 == 1 ) {
@@ -209,16 +235,10 @@ int  main(int argc, char **argv) {
         //fprintf(stderr, "%s -> %d\n", parse_byte, aes_key[i][j/2]);
       }
     }
-
-    fprintf(stdout, "Parsed key:\t");
-    for (j=0; j<mode_val/8; ++j) {
-      fprintf(stdout, "%02x", aes_key[i][j]);
-    }
-    fprintf(stdout, "\n");
   }
 
   for (i=0; i<2; ++i) {
-    util_Free(aes_key[i]);
+    print_hex(stdout, "Parsed key:\t", aes_key[i], mode_val/8);
   }
 
   UCHAR* input_data;
@@ -251,10 +271,12 @@ int  main(int argc, char **argv) {
   while ( (bytes_read = fread (input_data, 1, aes_block_size * step_size, fd)) == aes_block_size * step_size ) {
     intel_AES_enc_CBC(input_data, output_data, aes_key[0], step_size, iv);
     memcpy(iv, output_data + (step_size - 1) * aes_block_size, aes_block_size);
+    total_bytes += bytes_read;
   }
 
   if (feof(fd)) {
     //EOF handling
+    total_bytes += bytes_read;
     blocks = bytes_read / aes_block_size;
     if ( bytes_read % aes_block_size > 0 ) {
       input_data[blocks] = 128;
@@ -263,24 +285,39 @@ int  main(int argc, char **argv) {
       } 
       ++blocks;
     }
+
+    if ( total_bytes == 0 ) {
+      input_data[0] = 128;
+      memset(input_data + 1, 0, aes_block_size - 1);
+      ++blocks;
+    }
+
     if ( blocks > 0 ) {
       intel_AES_enc_CBC(input_data, output_data, aes_key[0], blocks, iv);
     }
 
     //Final Encryption
     memcpy(input_data, output_data + (blocks - 1) * aes_block_size, aes_block_size);
+    print_hex(stdout, "Before the last encryption: \t", input_data, aes_block_size);
     intel_AES_enc (input_data, output_data, aes_key[1], 1);
+
     
   } else {
     fprintf(stderr,"fread: ERROR: %s\n", strerror(errno));
     return 1;
   }
 
-    fprintf(stderr, "CBC_EMAC:\t");
-    for (j=0; j < aes_block_size; ++j) {
-      fprintf(stdout, "%02x", output_data[j]);
-    }
-    fprintf(stdout, "\n");
+    print_hex(stdout, "CBC_EMAC:\t", output_data, aes_block_size);
+    fprintf(stdout, "Total bytes processed:\t %" PRIu64 "\n", total_bytes);
+
+  util_Free(iv);
+  util_Free(output_data);
+  util_Free(input_data);
+
+  for (i=0; i<2; ++i) {
+    util_Free(aes_key[i]);
+  }
+
 
 
 	return 0;
